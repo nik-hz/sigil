@@ -8,7 +8,36 @@ from pathlib import Path
 import libcst as cst
 
 from sigil.format import compute_hash, parse_sigil_line
-from sigil.languages.base import FunctionRecord
+from sigil.languages.base import FunctionRecord, ModuleRecord
+
+
+def _collect_calls_from_node(node: cst.CSTNode) -> list[str]:
+    """Recursively collect function call names from a libcst node."""
+    calls: list[str] = []
+    _walk_cst_calls(node, calls)
+    return sorted(set(calls))
+
+
+def _walk_cst_calls(node: cst.CSTNode, calls: list[str]) -> None:
+    """Walk libcst tree to find Call nodes."""
+    if isinstance(node, cst.Call):
+        name = _extract_call_name(node.func)
+        if name:
+            calls.append(name)
+    for child in node.children:
+        _walk_cst_calls(child, calls)
+
+
+def _extract_call_name(node: cst.BaseExpression) -> str | None:
+    """Extract a dotted call name from a Call func node."""
+    if isinstance(node, cst.Name):
+        return node.value
+    if isinstance(node, cst.Attribute):
+        parent = _extract_call_name(node.value)
+        if parent:
+            return f"{parent}.{node.attr.value}"
+        return node.attr.value
+    return None
 
 
 class _Visitor(cst.CSTVisitor):
@@ -44,7 +73,10 @@ class _Visitor(cst.CSTVisitor):
         pos = self.get_metadata(cst.metadata.PositionProvider, node)
         line_range = (pos.start.line, pos.end.line)
 
-        self.records.append(FunctionRecord(symbol_id, h, line_range, existing))
+        # Collect calls within the function body.
+        calls = _collect_calls_from_node(node.body)
+
+        self.records.append(FunctionRecord(symbol_id, h, line_range, existing, calls=calls))
         self.scope.append(node.name.value)
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef) -> None:
@@ -90,6 +122,47 @@ class _Updater(cst.CSTTransformer):
         return updated_node.with_changes(leading_lines=tuple(new_leading))
 
 
+def _extract_python_module_info(module: cst.Module, source: str, rel_path: str) -> ModuleRecord:
+    """Extract module-level info: imports and top-level exports."""
+    imports: list[str] = []
+    exports: list[str] = []
+
+    for stmt in module.body:
+        # Unwrap simple statements
+        node = stmt
+        if isinstance(node, cst.SimpleStatementLine):
+            for item in node.body:
+                if isinstance(item, cst.Import):
+                    if isinstance(item.names, cst.ImportStar):
+                        imports.append("*")
+                    elif isinstance(item.names, (list, tuple)):
+                        for alias in item.names:
+                            imports.append(cst.Module(body=[]).code_for_node(alias.name).strip())
+                elif isinstance(item, cst.ImportFrom):
+                    mod = cst.Module(body=[]).code_for_node(item.module).strip() if item.module else ""
+                    if mod:
+                        imports.append(mod)
+                elif isinstance(item, (cst.Assign, cst.AnnAssign)):
+                    if isinstance(item, cst.Assign):
+                        for target in item.targets:
+                            if isinstance(target.target, cst.Name):
+                                exports.append(target.target.value)
+                    elif isinstance(item, cst.AnnAssign) and isinstance(item.target, cst.Name):
+                        exports.append(item.target.value)
+        elif isinstance(node, cst.FunctionDef):
+            exports.append(node.name.value)
+        elif isinstance(node, cst.ClassDef):
+            exports.append(node.name.value)
+
+    line_count = source.count("\n") + 1
+    lang = "python"
+    return ModuleRecord(
+        file=rel_path, language=lang,
+        imports=sorted(set(imports)), exports=sorted(set(exports)),
+        line_count=line_count,
+    )
+
+
 class PythonAdapter:
     comment_prefix: str = "#"
     extensions: tuple[str, ...] = (".py",)
@@ -101,6 +174,11 @@ class PythonAdapter:
         visitor = _Visitor(rel_path)
         wrapper.visit(visitor)
         return visitor.records
+
+    def parse_module(self, path: Path, rel_path: str) -> ModuleRecord:
+        source = path.read_text(encoding="utf-8")
+        module = cst.parse_module(source)
+        return _extract_python_module_info(module, source, rel_path)
 
     def write_sigils(self, path: Path, rel_path: str, sigils: dict[str, str]) -> None:
         if not sigils:

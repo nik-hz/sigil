@@ -7,7 +7,7 @@ from pathlib import Path
 from sigil.format import format_sigil_line, now_iso
 from sigil.languages import get_adapter
 from sigil.languages.base import FunctionRecord
-from sigil.sidecar import SIDECAR_DIR, Sidecar
+from sigil.sidecar import SIDECAR_DIR, Sidecar, infer_tags
 
 DEFAULT_IGNORE_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", "dist", "build", ".sigil"}
 
@@ -27,7 +27,7 @@ def is_ignored(path: Path, root: Path) -> bool:
 
 def _record_from_existing(rel: str, rec: FunctionRecord, language: str) -> dict:
     bc = rec.existing_sigil
-    return {
+    result = {
         "file": rel,
         "language": language,
         "line_range": list(rec.line_range),
@@ -38,6 +38,10 @@ def _record_from_existing(rel: str, rec: FunctionRecord, language: str) -> dict:
         "sigil_agent": bc["agent_id"] if bc else None,
         "sigil_timestamp": bc["timestamp"] if bc else None,
     }
+    if rec.calls is not None:
+        result["calls"] = rec.calls
+    result["tags"] = infer_tags(rel)
+    return result
 
 
 # Map extensions to language names for sidecar records.
@@ -75,7 +79,7 @@ def update_for_file(root: Path, file_path: Path, agent_id: str, stamp_new: bool 
                 role = rec.symbol_id.split("::", 1)[1].split(".")[-1]
                 line_text = format_sigil_line(rec.body_hash, role, agent_id, ts, prefix=adapter.comment_prefix)
                 sigils_to_write[rec.symbol_id] = line_text
-                sidecar.upsert(rec.symbol_id, {
+                entry = {
                     "file": rel,
                     "language": language,
                     "line_range": list(rec.line_range),
@@ -85,7 +89,11 @@ def update_for_file(root: Path, file_path: Path, agent_id: str, stamp_new: bool 
                     "sigil_role": role,
                     "sigil_agent": agent_id,
                     "sigil_timestamp": ts,
-                })
+                }
+                if rec.calls is not None:
+                    entry["calls"] = rec.calls
+                entry["tags"] = infer_tags(rel)
+                sidecar.upsert(rec.symbol_id, entry)
                 summary["stamped"].append(rec.symbol_id)
             else:
                 sidecar.upsert(rec.symbol_id, _record_from_existing(rel, rec, language))
@@ -101,7 +109,7 @@ def update_for_file(root: Path, file_path: Path, agent_id: str, stamp_new: bool 
         line_text = format_sigil_line(rec.body_hash, role, agent_id, ts, prefix=adapter.comment_prefix)
         sigils_to_write[rec.symbol_id] = line_text
 
-        sidecar.upsert(rec.symbol_id, {
+        entry = {
             "file": rel,
             "language": language,
             "line_range": list(rec.line_range),
@@ -111,7 +119,14 @@ def update_for_file(root: Path, file_path: Path, agent_id: str, stamp_new: bool 
             "sigil_role": role,
             "sigil_agent": agent_id,
             "sigil_timestamp": ts,
-        })
+        }
+        if rec.calls is not None:
+            entry["calls"] = rec.calls
+        # Preserve user-set tags, merge with auto-inferred.
+        existing_tags = prev.get("tags", [])
+        auto_tags = infer_tags(rel)
+        entry["tags"] = sorted(set(existing_tags + auto_tags))
+        sidecar.upsert(rec.symbol_id, entry)
         summary["stamped"].append(rec.symbol_id)
 
     if sigils_to_write:

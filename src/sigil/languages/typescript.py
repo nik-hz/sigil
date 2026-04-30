@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from sigil.format import compute_hash, parse_sigil_line
-from sigil.languages.base import FunctionRecord, treesitter_write_sigils
+from sigil.languages.base import FunctionRecord, ModuleRecord, treesitter_parse_module, treesitter_write_sigils
 
 # Lazy-loaded parsers.
 _js_parser = None
@@ -80,6 +80,40 @@ def _walk_functions(node, rel_path: str, source_bytes: bytes, source_lines: list
             _walk_functions(child, rel_path, source_bytes, source_lines, scope, records)
 
 
+def _collect_calls(node) -> list[str]:
+    """Recursively collect function call names from a tree-sitter node."""
+    calls: list[str] = []
+    _walk_calls(node, calls)
+    return sorted(set(calls))
+
+
+def _walk_calls(node, calls: list[str]) -> None:
+    """Walk tree-sitter AST to find call_expression nodes."""
+    if node.type == "call_expression":
+        func_node = node.child_by_field_name("function")
+        if func_node:
+            name = _ts_call_name(func_node)
+            if name:
+                calls.append(name)
+    for child in node.children:
+        _walk_calls(child, calls)
+
+
+def _ts_call_name(node) -> str | None:
+    """Extract call name from a call_expression function node."""
+    if node.type == "identifier":
+        return node.text.decode()
+    if node.type == "member_expression":
+        prop = node.child_by_field_name("property")
+        obj = node.child_by_field_name("object")
+        if prop and obj:
+            parent = _ts_call_name(obj)
+            if parent:
+                return f"{parent}.{prop.text.decode()}"
+            return prop.text.decode()
+    return None
+
+
 def _record_function(node, func_name: str, rel_path: str, source_bytes: bytes,
                      source_lines: list[str], scope: list[str],
                      records: list[FunctionRecord]) -> None:
@@ -98,7 +132,8 @@ def _record_function(node, func_name: str, rel_path: str, source_bytes: bytes,
         existing = parse_sigil_line(above)
 
     line_range = (start_line + 1, node.end_point[0] + 1)  # 1-based
-    records.append(FunctionRecord(symbol_id, h, line_range, existing))
+    calls = _collect_calls(node)
+    records.append(FunctionRecord(symbol_id, h, line_range, existing, calls=calls))
 
 
 class TypeScriptAdapter:
@@ -114,6 +149,16 @@ class TypeScriptAdapter:
         records: list[FunctionRecord] = []
         _walk_functions(tree.root_node, rel_path, source_bytes, source_lines, [], records)
         return records
+
+    def parse_module(self, path: Path, rel_path: str) -> ModuleRecord:
+        parser = _get_parser(path.suffix)
+        lang = "typescript" if path.suffix in (".ts", ".tsx") else "javascript"
+        return treesitter_parse_module(
+            path, rel_path, lang, parser,
+            export_node_types=["function_declaration", "class_declaration",
+                               "lexical_declaration", "variable_declaration"],
+            import_node_types=["import_statement"],
+        )
 
     def write_sigils(self, path: Path, rel_path: str, sigils: dict[str, str]) -> None:
         treesitter_write_sigils(path, sigils, self.comment_prefix, self.parse, rel_path)
